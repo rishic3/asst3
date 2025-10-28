@@ -48,6 +48,99 @@ __global__ void scan_downsweep(int* result, int N, int two_d) {
     }
 }
 
+__global__ void excl_scan_block(int* result, int N) {
+    size_t tid = threadIdx.x;
+    extern __shared__ int smem[];
+    
+    // read (two elems per thread)
+    smem[2 * tid] = result[2 * tid];
+    smem[2 * tid + 1] = result[2 * tid + 1];
+
+    // upsweep
+    for (int two_d = 1; two_d < N; two_d <<= 1) {  // 1, 2, 4, 8,...
+        __syncthreads();
+        int two_dplus1 = two_d << 1;
+        if (tid < N / two_dplus1) {  // 2, 4, 8, 16,...
+            // t0: smem[0+2-1 = 1] += smem[0+1-1 = 0]
+            // t1: smem[2+2-1 = 3] += smem[2+1-1 = 2]
+            //
+            // t0: smem[0+4-1 = 3] += smem[0+2-1 = 1]
+            // t1: smem[4+4-1 = 7] += smem[4+2-1 = 5]
+            //
+            // t0: smem[0+8-1 = 7] += smem[0+4-1 = 3]
+            // t1: smem[8+8-1 = 15] += smem[8+4-1 = 11]
+            smem[tid * two_dplus1 + two_dplus1 - 1] += smem[tid * two_dplus1 + two_d - 1];
+        }
+    }
+
+    __syncthreads();
+    if (tid == 0) smem[N - 1] = 0;
+
+    // downsweep
+    for (int two_d = N >> 1; two_d > 0; two_d >>= 1) {
+        __syncthreads();
+        int two_dplus1 = two_d << 1;
+        if (tid < N / two_dplus1) {
+            int t = smem[tid * two_dplus1 + two_d - 1];
+            smem[tid * two_dplus1 + two_d - 1] = smem[tid * two_dplus1 + two_dplus1 - 1];
+            smem[tid * two_dplus1 + two_dplus1 - 1] += t;
+        }
+    }
+
+    // write (two elems per thread)
+    __syncthreads();
+    result[2 * tid] = smem[2 * tid];
+    result[2 * tid + 1] = smem[2 * tid + 1];
+}
+
+
+__global__ void excl_scan(int* result, int N, int* sums) {
+    int tid = threadIdx.x;
+    int block_offset = blockIdx.x * blockDim.x * 2;
+    extern __shared__ int smem[];
+    
+    // read (two elems per thread)
+    smem[2 * tid] = result[block_offset + 2 * tid];
+    smem[2 * tid + 1] = result[block_offset + 2 * tid + 1];
+
+    // upsweep
+    for (int two_d = 1; two_d < N; two_d <<= 1) {
+        __syncthreads();
+        int two_dplus1 = two_d << 1;
+        if (tid < N / two_dplus1) {
+            smem[tid * two_dplus1 + two_dplus1 - 1] += smem[tid * two_dplus1 + two_d - 1];
+        }
+    }
+
+    // write scan sum to block_sums
+    __syncthreads();
+    if (tid == 0) {
+        sums[blockIdx.x] = smem[N - 1];
+        smem[N - 1] = 0;
+    }
+
+    // downsweep
+    for (int two_d = N >> 1; two_d > 0; two_d >>= 1) {
+        __syncthreads();
+        int two_dplus1 = two_d << 1;
+        if (tid < N / two_dplus1) {
+            int t = smem[tid * two_dplus1 + two_d - 1];
+            smem[tid * two_dplus1 + two_d - 1] = smem[tid * two_dplus1 + two_dplus1 - 1];
+            smem[tid * two_dplus1 + two_dplus1 - 1] += t;
+        }
+    }
+
+    // write (two elems per thread)
+    __syncthreads();
+    result[block_offset + 2 * tid] = smem[2 * tid];
+    result[block_offset + 2 * tid + 1] = smem[2 * tid + 1];
+}
+
+__global__ void uniform_add(int* result, int* incr) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    result[idx] += incr[blockIdx.x];
+}
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -75,10 +168,10 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
-    bool do_better = false;
+    bool do_better = true;
 
     if (!do_better) {  
-        // original upsweep-downsweep implementation
+        // original upsweep, downsweep implementation with kernel at every iteration.
         N = nextPow2(N);
         for (int two_d = 1; two_d <= N/2; two_d *= 2) {
             int two_dplus1 = 2 * two_d;
@@ -93,15 +186,41 @@ void exclusive_scan(int* input, int N, int* result)
 
         for (int two_d = N/2; two_d >= 1; two_d /= 2) {
             int two_dplus1 = 2 * two_d;
-            // for simplicity, always invoke THREADS_PER_BLOCK threads. 
-            // number of blocks needed goes down as we reduce.
             int n_active_threads = N / two_dplus1;
             int n_blocks = (n_active_threads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
             scan_downsweep<<<n_blocks, THREADS_PER_BLOCK>>>(result, N, two_d); 
         }
     } else {
-        // try to beat thrust
+        // better version with single kernel.
+        N = nextPow2(N);
+        const int ELEMS_PER_BLOCK = (THREADS_PER_BLOCK * 2);
+
+        if (N <= ELEMS_PER_BLOCK) {
+            // run single-block exclusive scan if the array fits in a block
+            excl_scan_block<<<1, N / 2, N * sizeof(int)>>>(result, N);
+            return;
+        }
         
+        const int n_blocks = N / ELEMS_PER_BLOCK;
+        const int smem_size = ELEMS_PER_BLOCK * sizeof(int);
+        
+        int* sums;
+        int* incr;
+        cudaMalloc(&sums, n_blocks * sizeof(int));
+        cudaMalloc(&incr, n_blocks * sizeof(int));
+
+        // run multi-block excl scan
+        excl_scan<<<n_blocks, THREADS_PER_BLOCK, smem_size>>>(result, ELEMS_PER_BLOCK, sums);
+        cudaMemcpy(incr, sums, n_blocks * sizeof(int), cudaMemcpyDeviceToDevice);
+        
+        // recurse on sums and store in incr
+        exclusive_scan(sums, n_blocks, incr);
+
+        // add incr[j] to all elements in block j
+        uniform_add<<<n_blocks, ELEMS_PER_BLOCK>>>(result, incr);
+
+        cudaFree(sums);
+        cudaFree(incr);
     }
 }
 
@@ -208,7 +327,7 @@ __global__ void flag_repeats(int* input, int length, int* output) {
     }
 }
 
-__global__ void compact_scan(int* scan, int* flags, int length, int* output) {
+__global__ void scatter(int* scan, int* flags, int length, int* output) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < length) {
         if (flags[idx]) {
@@ -254,12 +373,12 @@ int find_repeats(int* device_input, int length, int* device_output) {
     exclusive_scan(flags, length, scan);
 
     // length is end of scan
-    // (to be precise it should be scan[length-1] + flags[length-1], but flags[length-1] is always zero)
+    // (to be precise it is scan[length-1] + flags[length-1], but flags[length-1] is always zero)
     int num_pairs;
     cudaMemcpy(&num_pairs, &scan[length - 1], sizeof(int), cudaMemcpyDeviceToHost);
 
-    // compact into output
-    compact_scan<<<num_blocks, THREADS_PER_BLOCK>>>(scan, flags, length, device_output);
+    // scatter into output
+    scatter<<<num_blocks, THREADS_PER_BLOCK>>>(scan, flags, length, device_output);
 
     cudaFree(scan);
     cudaFree(flags);
