@@ -211,9 +211,9 @@ void exclusive_scan(int* input, int N, int* result)
 
         // run multi-block excl scan
         excl_scan<<<n_blocks, THREADS_PER_BLOCK, smem_size>>>(result, ELEMS_PER_BLOCK, sums);
-        cudaMemcpy(incr, sums, n_blocks * sizeof(int), cudaMemcpyDeviceToDevice);
         
         // recurse on sums and store in incr
+        cudaMemcpy(incr, sums, n_blocks * sizeof(int), cudaMemcpyDeviceToDevice);
         exclusive_scan(sums, n_blocks, incr);
 
         // add incr[j] to all elements in block j
