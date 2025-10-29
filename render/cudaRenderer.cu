@@ -8,11 +8,29 @@
 #include <cuda_runtime.h>
 #include <driver_functions.h>
 
+#include "circleRenderer.h"
 #include "cudaRenderer.h"
 #include "image.h"
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+
+#define DEBUG
+
+#ifdef DEBUG
+#define cudaCheck(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheck(ans) ans
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -381,50 +399,72 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
 // kernelRenderCircles -- (CUDA device code)
 //
-// Each thread renders a circle.  Since there is no protection to
-// ensure order of update or mutual exclusion on the output image, the
-// resulting image will be incorrect.
+// Each thread renders a pixel.
+template<SceneName scene>
 __global__ void kernelRenderCircles() {
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (index >= cuConstRendererParams.numCircles)
-        return;
-
-    int index3 = 3 * index;
-
-    // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
-
-    // compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
 
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+    // bounds check
+    if (pixelX >= imageWidth || pixelY >= imageHeight) return;
 
+    // get my normalized pixel coordinates
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
+    float pixelCenterNormX = invWidth * (static_cast<float>(pixelX) + 0.5f);
+    float pixelCenterNormY = invHeight * (static_cast<float>(pixelY) + 0.5f);
 
-    // for all pixels in the bonding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
-            imgPtr++;
+    // global memory read of pixel (independent per thread)
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float4 newColor = *imgPtr;
+
+    const float kCircleMaxAlpha = .5f;
+    const float falloffScale = 4.f;
+
+    // iterate over circles sequentially
+    for (int circleIndex = 0; circleIndex < cuConstRendererParams.numCircles; ++circleIndex) {
+        // get circle
+        int index3 = 3 * circleIndex;
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+
+        // --- in-lined logic for shadePixel ---
+        float rad = cuConstRendererParams.radius[circleIndex];
+        float maxDist = rad * rad;
+        float diffX = p.x - pixelCenterNormX;
+        float diffY = p.y - pixelCenterNormY;
+        float pixelDist = diffX * diffX + diffY * diffY;
+
+        // circle does not contribute to this pixel
+        if (pixelDist > maxDist) continue;
+
+        float3 rgb;
+        float alpha;
+
+        if constexpr (scene == SNOWFLAKES || scene == SNOWFLAKES_SINGLE_FRAME) {
+            float normPixelDist = sqrt(pixelDist) / rad;
+            rgb = lookupColor(normPixelDist);
+
+            float maxAlpha = .6f + .4f * (1.f - p.z);
+            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+            alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+        } else {
+            rgb = *(float3*)(&cuConstRendererParams.color[index3]);
+            alpha = .5f;
         }
+
+        float oneMinusAlpha = 1.f - alpha;
+
+        // update new color with this circle's contribution
+        newColor.x = alpha * rgb.x + oneMinusAlpha * newColor.x;
+        newColor.y = alpha * rgb.y + oneMinusAlpha * newColor.y;
+        newColor.z = alpha * rgb.z + oneMinusAlpha * newColor.z;
+        newColor.w += alpha;
     }
+
+    *imgPtr = newColor;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -637,9 +677,19 @@ void
 CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    dim3 blockDim(16, 16);
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y
+    );
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    if (sceneName == SNOWFLAKES) {
+        kernelRenderCircles<SNOWFLAKES><<<gridDim, blockDim>>>();
+    } else if (sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        kernelRenderCircles<SNOWFLAKES_SINGLE_FRAME><<<gridDim, blockDim>>>();
+    } else {  // default path
+        kernelRenderCircles<CIRCLE_RGB><<<gridDim, blockDim>>>();
+    }
+    
     cudaDeviceSynchronize();
 }
