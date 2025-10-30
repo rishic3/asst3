@@ -496,7 +496,7 @@ __global__ void kernelRenderCircles() {
     const float kCircleMaxAlpha = .5f;
     const float falloffScale = 4.f;
 
-    // if overflow, we'll check all circles as a fallback (bad - please don't happen)
+    // if overflow, we'll check all circles as a fallback
     int candidates_to_check = overflow ? numCircles : num_candidates;
 
     // iterate over candidate circles sequentially

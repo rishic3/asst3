@@ -497,3 +497,68 @@ __global__ void kernelRenderCircles() {
     *imgPtr = newColor;
 }
 ```
+
+yay, it works:
+```text
+--------------------------------------------------------------------------
+| Scene Name      | Ref Time (T_ref) | Your Time (T)   | Score           |
+--------------------------------------------------------------------------
+| rgb             | 0.2534           | 0.254           | 9               |
+| rand10k         | 3.0598           | 2.963           | 9               |
+| rand100k        | 29.667           | 28.2294         | 9               |
+| pattern         | 0.3951           | 0.4078          | 9               |
+| snowsingle      | 19.6878          | 19.8177         | 9               |
+| biglittle       | 15.1899          | 14.1093         | 9               |
+| rand1M          | 232.4888         | 233.6674        | 9               |
+| micro2M         | 448.0229         | 450.0085        | 9               |
+--------------------------------------------------------------------------
+|                                    | Total score:    | 72/72           |
+--------------------------------------------------------------------------
+```
+
+Profiling with 
+```shell
+$ sudo /usr/local/cuda-12.8/bin/ncu --set full ./render -c rand1M -s 1024
+
+...
+
+    Section: Warp State Statistics
+    ---------------------------------------- ----------- ------------
+    Metric Name                              Metric Unit Metric Value
+    ---------------------------------------- ----------- ------------
+    Warp Cycles Per Issued Instruction             cycle        22.58
+    Warp Cycles Per Executed Instruction           cycle        22.60
+    Avg. Active Threads Per Warp                                29.81
+    Avg. Not Predicated Off Threads Per Warp                    28.44
+    ---------------------------------------- ----------- ------------
+
+    OPT   Est. Speedup: 35.04%                                                                                          
+          On average, each warp of this workload spends 10.9 cycles being stalled waiting for sibling warps at a CTA    
+          barrier. A high number of warps waiting at a barrier is commonly caused by diverging code paths before a      
+          barrier. This causes some warps to wait a long time until other warps reach the synchronization point.        
+          Whenever possible, try to divide up the work into blocks of uniform workloads. If the block size is 512       
+          threads or greater, consider splitting it into smaller groups. This can increase eligible warps without       
+          affecting occupancy, unless shared memory becomes a new occupancy limiter. Also, try to identify which        
+          barrier instruction causes the most stalls, and optimize the code executed before that synchronization point  
+          first. This stall type represents about 48.2% of the total average of 22.6 cycles between issuing two         
+          instructions.  
+...
+```
+
+
+2-kernel approach:
+```text
+--------------------------------------------------------------------------
+| Scene Name      | Ref Time (T_ref) | Your Time (T)   | Score           |
+--------------------------------------------------------------------------
+| rgb             | 0.2498           | 0.3171          | 8               |
+| rand10k         | 3.0559           | 3.1473          | 9               |
+| rand100k        | 29.6081          | 30.4529         | 9               |
+| pattern         | 0.3919           | 0.5112          | 8               |
+| snowsingle      | 19.5758          | 19.8229         | 9               |
+| biglittle       | 15.1747          | 16.117          | 9               |
+| rand1M          | 228.0776         | 218.5261        | 9               |
+| micro2M         | 440.0755         | 420.3085        | 9               |
+--------------------------------------------------------------------------
+|                                    | Total score:    | 70/72           |
+```
