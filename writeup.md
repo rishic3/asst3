@@ -208,16 +208,16 @@ The first pass resolved the correctness issues, which was a good sign for the fi
 --------------------------------------------------------------------------
 | Scene Name      | Ref Time (T_ref) | Your Time (T)   | Score           |
 --------------------------------------------------------------------------
-| rgb             | 0.0052           | 0.089           | 2               |
-| rand10k         | 0.0048           | 26.4764         | 2               |
-| rand100k        | 0.0046           | 259.8125        | 2               |
-| pattern         | 0.0059           | 3.247           | 2               |
-| snowsingle      | 0.0046           | 140.7397        | 2               |
-| biglittle       | 0.0045           | 26.5156         | 2               |
-| rand1M          | 0.0048           | 2541.1458       | 2               |
-| micro2M         | 0.0043           | 5215.9366       | 2               |
+| rgb             | 0.2502           | 0.2459          | 9               |
+| rand10k         | 3.0614           | 69.7325         | 2               |
+| rand100k        | 29.6683          | 721.9569        | 2               |
+| pattern         | 0.3933           | 7.9576          | 2               |
+| snowsingle      | 19.6507          | 431.9749        | 2               |
+| biglittle       | 15.2659          | 72.233          | 4               |
+| rand1M          | 235.7366         | 7899.5876       | 2               |
+| micro2M         | 453.8863         | 18524.8016      | 2               |
 --------------------------------------------------------------------------
-|                                    | Total score:    | 16/72           |
+|                                    | Total score:    | 25/72           |
 --------------------------------------------------------------------------
 ```
 
@@ -358,3 +358,142 @@ After testing my implementation:
 ```
 ...one of the correctness criteria was broken. Notably each thread is atomically updating an index to track the number of candidates, but this doesn't preserve the *ordering* of the candidates, now that we're processing circles in parallel.
 
+A new challenge is to leverage the parallelism across circles while preserving the ordering. Using a hint from the README about exclusive scan (and on EdStem - thanks Weixin!), 
+
+```cpp
+template<SceneName scene>
+__global__ void kernelRenderCircles() {
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    // --- pre-filtration ---
+    __shared__ int candidate_circles[MAX_CIRCLES_PER_BLOCK];
+    __shared__ int num_candidates;
+    __shared__ bool overflow;
+
+    __shared__ uint prefix_sum_input[SCAN_BLOCK_DIM];
+    __shared__ uint prefix_sum_output[SCAN_BLOCK_DIM];
+    __shared__ uint prefix_sum_scratch[2 * SCAN_BLOCK_DIM];
+
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        num_candidates = 0;
+        overflow = false;
+    }
+    __syncthreads();
+
+    // compute bounding box of our block
+    float blockMinX = blockIdx.x * blockDim.x * invWidth;
+    float blockMaxX = (blockIdx.x + 1) * blockDim.x * invWidth;
+    float blockMinY = blockIdx.y * blockDim.y * invHeight;
+    float blockMaxY = (blockIdx.y + 1) * blockDim.y * invHeight;
+
+    int linearThreadIndex = threadIdx.y * blockDim.x + threadIdx.x;
+    int numCircles = cuConstRendererParams.numCircles;
+
+    // check circle overlap in parallel
+    for (int blk = 0; blk < numCircles; blk += SCAN_BLOCK_DIM) {
+        int circleIndex = blk + linearThreadIndex;
+        int is_in_box = 0;
+
+        // each thread checks a single circle in block
+        if (circleIndex < numCircles) {
+            int index3 = 3 * circleIndex;
+            float rad = cuConstRendererParams.radius[circleIndex];
+            float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+
+            // use true circle in box test
+            is_in_box = circleInBox(p.x, p.y, rad, blockMinX, blockMaxX, blockMaxY, blockMinY);
+        }
+
+        // run scan to turn is_in_box flags into write locations
+        prefix_sum_input[linearThreadIndex] = is_in_box;
+        __syncthreads();
+        sharedMemExclusiveScan(linearThreadIndex, prefix_sum_input, prefix_sum_output, prefix_sum_scratch, SCAN_BLOCK_DIM);
+        __syncthreads();
+
+        // if is in box and max circles not yet exceeded, write to candidates
+        // note write loc is offset by num_candidates to account for block
+        uint write_loc_offset = prefix_sum_output[linearThreadIndex];
+        if (is_in_box && (num_candidates + write_loc_offset < MAX_CIRCLES_PER_BLOCK)) {
+            candidate_circles[num_candidates + write_loc_offset] = circleIndex;
+        }
+        __syncthreads();
+
+        // last thread updates total count added in this block
+        if (linearThreadIndex == SCAN_BLOCK_DIM - 1) {
+            int new_num_candidates = num_candidates + write_loc_offset + is_in_box;
+            // check if we've exceeded capacity, in which case set overflow
+            if (new_num_candidates > MAX_CIRCLES_PER_BLOCK) overflow = true;
+            num_candidates = min(new_num_candidates, MAX_CIRCLES_PER_BLOCK);
+        }
+        __syncthreads();
+
+        if (num_candidates >= MAX_CIRCLES_PER_BLOCK) break;
+    }
+    __syncthreads();
+
+    // --- pixel processing ---
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    if (pixelX >= imageWidth || pixelY >= imageHeight) return;
+
+    // get my normalized pixel coordinates
+    float pixelCenterNormX = invWidth * (static_cast<float>(pixelX) + 0.5f);
+    float pixelCenterNormY = invHeight * (static_cast<float>(pixelY) + 0.5f);
+
+    // global memory read of pixel (independent per thread)
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float4 newColor = *imgPtr;
+
+    const float kCircleMaxAlpha = .5f;
+    const float falloffScale = 4.f;
+
+    // if overflow, we'll check all circles as a fallback (bad - please don't happen)
+    int candidates_to_check = overflow ? numCircles : num_candidates;
+
+    // iterate over candidate circles sequentially
+    for (int i = 0; i < candidates_to_check; ++i) {
+        // no overflow: index from candidates, overflow: index entire range
+        int circleIndex = overflow ? i : candidate_circles[i];
+        int index3 = 3 * circleIndex;
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+
+        // --- shadePixel ---
+        float rad = cuConstRendererParams.radius[circleIndex];
+        float maxDist = rad * rad;
+        float diffX = p.x - pixelCenterNormX;
+        float diffY = p.y - pixelCenterNormY;
+        float pixelDist = diffX * diffX + diffY * diffY;
+
+        // circle does not contribute to this pixel
+        if (pixelDist > maxDist) continue;
+
+        float3 rgb;
+        float alpha;
+
+        if constexpr (scene == SNOWFLAKES || scene == SNOWFLAKES_SINGLE_FRAME) {
+            float normPixelDist = sqrt(pixelDist) / rad;
+            rgb = lookupColor(normPixelDist);
+
+            float maxAlpha = .6f + .4f * (1.f - p.z);
+            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+            alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+        } else {
+            rgb = *(float3*)(&cuConstRendererParams.color[index3]);
+            alpha = .5f;
+        }
+
+        float oneMinusAlpha = 1.f - alpha;
+
+        // update new color with this circle's contribution
+        newColor.x = alpha * rgb.x + oneMinusAlpha * newColor.x;
+        newColor.y = alpha * rgb.y + oneMinusAlpha * newColor.y;
+        newColor.z = alpha * rgb.z + oneMinusAlpha * newColor.z;
+        newColor.w += alpha;
+    }
+
+    *imgPtr = newColor;
+}
+```
