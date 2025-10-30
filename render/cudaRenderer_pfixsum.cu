@@ -77,6 +77,8 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
 // max number of candidate circles to consider for a block (8KB in shared memory)
 #define MAX_CIRCLES_PER_BLOCK 2048
+#define SCAN_BLOCK_DIM 256  // 16x16 threads per block
+#include "exclusiveScan.cu_inl"
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -411,14 +413,17 @@ __global__ void kernelRenderCircles() {
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
 
-    // --- pre-filtration ---
+    // --- pre-filtration using prefix sum for ordered compaction ---
     __shared__ int candidate_circles[MAX_CIRCLES_PER_BLOCK];
     __shared__ int num_candidates;
-    __shared__ bool overflow;
+    
+    // Shared memory for prefix sum
+    __shared__ uint prefixSumInput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumOutput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumScratch[2 * SCAN_BLOCK_DIM];
 
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         num_candidates = 0;
-        overflow = false;
     }
     __syncthreads();
 
@@ -428,21 +433,49 @@ __global__ void kernelRenderCircles() {
     float blockMinY = blockIdx.y * blockDim.y * invHeight;
     float blockMaxY = (blockIdx.y + 1) * blockDim.y * invHeight;
 
-    // check circle overlap in parallel
-    for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < cuConstRendererParams.numCircles; i += blockDim.x * blockDim.y) {
-        int index3 = 3 * i;
-        float rad = cuConstRendererParams.radius[i];
-        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    // Linear thread index for prefix sum (must be linearized in this specific order)
+    int linearThreadIndex = threadIdx.y * blockDim.x + threadIdx.x;
 
-        // use true circle in box test, the candidate list is guaranteed to overlap with the block (but not necessarily the pixel).
-        if (circleInBox(p.x, p.y, rad, blockMinX, blockMaxX, blockMaxY, blockMinY)) {
-            int index = atomicAdd(&num_candidates, 1);
-            if (index >= MAX_CIRCLES_PER_BLOCK) {
-                // exceeded smem size, break
-                overflow = true;
-            } else {
-                candidate_circles[index] = i;
-            }
+    // Process circles in batches of SCAN_BLOCK_DIM
+    int numCircles = cuConstRendererParams.numCircles;
+    for (int batchStart = 0; batchStart < numCircles; batchStart += SCAN_BLOCK_DIM) {
+        // Each thread checks one circle in this batch
+        int circleIndex = batchStart + linearThreadIndex;
+        int inBox = 0;
+        
+        if (circleIndex < numCircles) {
+            int index3 = 3 * circleIndex;
+            float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+            float rad = cuConstRendererParams.radius[circleIndex];
+            
+            inBox = circleInBox(p.x, p.y, rad, blockMinX, blockMaxX, blockMaxY, blockMinY);
+        }
+        
+        // Populate prefix sum input
+        prefixSumInput[linearThreadIndex] = inBox;
+        __syncthreads();
+        
+        // Compute prefix sum to find output positions
+        sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, SCAN_BLOCK_DIM);
+        __syncthreads();
+        
+        // Write circles to candidate list if they're in the box
+        if (inBox && (num_candidates + prefixSumOutput[linearThreadIndex] < MAX_CIRCLES_PER_BLOCK)) {
+            int outputPos = num_candidates + prefixSumOutput[linearThreadIndex];
+            candidate_circles[outputPos] = circleIndex;
+        }
+        __syncthreads();
+        
+        // Update total count (last thread in batch has the total from this batch)
+        if (linearThreadIndex == SCAN_BLOCK_DIM - 1) {
+            int batchCount = prefixSumOutput[linearThreadIndex] + prefixSumInput[linearThreadIndex];
+            num_candidates = min(num_candidates + batchCount, MAX_CIRCLES_PER_BLOCK);
+        }
+        __syncthreads();
+        
+        // Stop if we've filled the candidate list
+        if (num_candidates >= MAX_CIRCLES_PER_BLOCK) {
+            break;
         }
     }
     __syncthreads();
@@ -463,12 +496,9 @@ __global__ void kernelRenderCircles() {
     const float kCircleMaxAlpha = .5f;
     const float falloffScale = 4.f;
 
-    // overflow case - fallback to considering all circles as candidates
-    if (overflow) num_candidates = cuConstRendererParams.numCircles;
-
-    // iterate over candidate circles sequentially
+    // iterate over candidate circles sequentially (they are in order!)
     for (int i = 0; i < num_candidates; ++i) {
-        int circleIndex = (overflow) ? i : candidate_circles[i];
+        int circleIndex = candidate_circles[i];
         int index3 = 3 * circleIndex;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
 
