@@ -1,0 +1,69 @@
+
+NOTICE: Existing SQLite export found: report1.sqlite
+        It is assumed file was previously exported from: report1.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [report1.sqlite] with [/opt/nvidia/nsight-systems/2024.6.2/host-linux-x64/rules/cuda_memcpy_async.py]... 
+
+ ** CUDA Async Memcpy with Pageable Memory (cuda_memcpy_async):
+
+There were no problems detected related to memcpy operations using pageable
+memory.
+
+Processing [report1.sqlite] with [/opt/nvidia/nsight-systems/2024.6.2/host-linux-x64/rules/cuda_memcpy_sync.py]... 
+
+ ** CUDA Synchronous Memcpy (cuda_memcpy_sync):
+
+The following are synchronous memory transfers that block the host. This does
+not include host to device transfers of a memory block of 64 KB or less.
+
+Suggestion: Use cudaMemcpy*Async() APIs instead.
+
+ Duration (ns)  Start (ns)   Src Kind  Dst Kind  Bytes (MB)     PID     Device ID  Context ID  Green Context ID  Stream ID      API Name    
+ -------------  -----------  --------  --------  ----------  ---------  ---------  ----------  ----------------  ---------  ----------------
+     4,665,305  349,772,244  Device    Pageable      16.777  3,405,008          0           1                            7  cudaMemcpy_v3020
+         7,296  323,024,290  Pageable  Device         0.120  3,405,008          0           1                            7  cudaMemcpy_v3020
+         6,240  323,048,290  Pageable  Device         0.120  3,405,008          0           1                            7  cudaMemcpy_v3020
+         6,208  323,068,386  Pageable  Device         0.120  3,405,008          0           1                            7  cudaMemcpy_v3020
+
+Processing [report1.sqlite] with [/opt/nvidia/nsight-systems/2024.6.2/host-linux-x64/rules/cuda_memset_sync.py]... 
+SKIPPED: report1.sqlite could not be analyzed because it does not contain the required CUDA data. Does the application use CUDA memset APIs?
+
+Processing [report1.sqlite] with [/opt/nvidia/nsight-systems/2024.6.2/host-linux-x64/rules/cuda_api_sync.py]... 
+
+ ** CUDA Synchronization APIs (cuda_api_sync):
+
+The following are synchronization APIs that block the host until all issued
+CUDA calls are complete.
+
+Suggestions:
+   1. Avoid excessive use of synchronization.
+   2. Use asynchronous CUDA event calls, such as cudaStreamWaitEvent() and
+cudaEventSynchronize(), to prevent host synchronization.
+
+ Duration (ns)  Start (ns)      PID        TID              API Name          
+ -------------  -----------  ---------  ---------  ---------------------------
+    26,443,439  323,321,270  3,405,008  3,405,008  cudaDeviceSynchronize_v3020
+        24,408  323,286,978  3,405,008  3,405,008  cudaDeviceSynchronize_v3020
+           402  323,311,482  3,405,008  3,405,008  cudaDeviceSynchronize_v3020
+           361  349,764,811  3,405,008  3,405,008  cudaDeviceSynchronize_v3020
+           296  323,312,023  3,405,008  3,405,008  cudaDeviceSynchronize_v3020
+           289  323,312,395  3,405,008  3,405,008  cudaDeviceSynchronize_v3020
+
+Processing [report1.sqlite] with [/opt/nvidia/nsight-systems/2024.6.2/host-linux-x64/rules/gpu_gaps.py]... 
+
+ ** GPU Gaps (gpu_gaps):
+
+There were no problems detected with GPU utilization. GPU was not found to be
+idle for more than 500ms.
+
+Processing [report1.sqlite] with [/opt/nvidia/nsight-systems/2024.6.2/host-linux-x64/rules/gpu_time_util.py]... 
+
+ ** GPU Time Utilization (gpu_time_util):
+
+There were no problems detected with GPU utilization. No time regions have an
+average GPU utilization below 50%%.
+
+Processing [report1.sqlite] with [/opt/nvidia/nsight-systems/2024.6.2/host-linux-x64/rules/dx12_mem_ops.py]... 
+SKIPPED: report1.sqlite could not be analyzed because it does not contain the required DX12 data. Does the application use DX12 APIs?
+
