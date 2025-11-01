@@ -419,9 +419,10 @@ __global__ void kernelRenderCircles() {
     __shared__ int num_candidates;
     __shared__ bool overflow;
 
-    __shared__ uint prefix_sum_input[SCAN_BLOCK_DIM];
-    __shared__ uint prefix_sum_output[SCAN_BLOCK_DIM];
-    __shared__ uint prefix_sum_scratch[2 * SCAN_BLOCK_DIM];
+    __shared__ int warp_num_candidates[SCAN_BLOCK_DIM / 32];  // warp-level candidate circles
+    __shared__ int warp_offsets[SCAN_BLOCK_DIM / 32]; // start write position in candidate list for this warp
+    __shared__ int candidate_offset;  // starting write position in candidate list (global) per iteration
+    __shared__ int candidates_to_write;  // num circles to write per iteration
 
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         num_candidates = 0;
@@ -443,6 +444,7 @@ __global__ void kernelRenderCircles() {
         int circleIndex = blk + linearThreadIndex;
         int is_in_box = 0;
 
+        // --- compute overlapping circles per warp ---
         // each thread checks a single circle in block
         if (circleIndex < numCircles) {
             int index3 = 3 * circleIndex;
@@ -453,26 +455,66 @@ __global__ void kernelRenderCircles() {
             is_in_box = circleInBox(p.x, p.y, rad, blockMinX, blockMaxX, blockMaxY, blockMinY);
         }
 
-        // run scan to turn is_in_box flags into write locations
-        prefix_sum_input[linearThreadIndex] = is_in_box;
-        __syncthreads();
-        sharedMemExclusiveScan(linearThreadIndex, prefix_sum_input, prefix_sum_output, prefix_sum_scratch, SCAN_BLOCK_DIM);
+        // get warp lane and warp id for this thread in 32-thread warp
+        const int lane = linearThreadIndex & 31;
+        const int warp_id = linearThreadIndex >> 5;  // dividing by warp size here
+        const int warps_per_block = SCAN_BLOCK_DIM / 32;
+
+        // collects is_in_box for the warp
+        // we want all all threads to vote here so 0xffffffff is all 32 bits set to 1
+        unsigned int ballot_is_in_box = __ballot_sync(0xffffffff, is_in_box);
+        // population count - count 1 bits in the mask, how many threads in warp saw is_inbox == 1
+        int warp_is_in_box_cnt = __popc(ballot_is_in_box);
+
+        // compute thread write position in warp output
+        unsigned int low_lanes_mask = (1u << lane) - 1;  // 1 bit in just my lane - 1 => 1 bits up to my lane
+        unsigned int low_lanes_active_mask = ballot_is_in_box & low_lanes_mask;  // how many lanes before me are writing
+        int lane_offset = __popc(low_lanes_active_mask);  // count bits => offset within warp
+
+        // first lane writes warp count to smem
+        if (lane == 0) warp_num_candidates[warp_id] = warp_is_in_box_cnt;
         __syncthreads();
 
-        // if is in box and max circles not yet exceeded, write to candidates
-        // note write loc is offset by num_candidates to account for block
-        uint write_loc_offset = prefix_sum_output[linearThreadIndex];
-        if (is_in_box && (num_candidates + write_loc_offset < MAX_CIRCLES_PER_BLOCK)) {
-            candidate_circles[num_candidates + write_loc_offset] = circleIndex;
+        // --- exclusive scan to get write locations ---
+        // thread 0 computes ordered warp offsets and reserves a contiguous range
+        if (linearThreadIndex == 0) {
+            int total = 0;
+            // just a serial excl scan over warp counts
+            // e.g. [4, 2, 0, 3, 1, 0, 2, 1]
+            for (int w = 0; w < warps_per_block; ++w) {
+                // warp_offsets[0] = 0, total = 4
+                // warp_offsets[1] = 4, total = 6
+                // warp_offsets[2] = 6, total = 6
+                // ...
+                // => warp_offsets=[0, 4, 6, 6, 9, 10, 10, 12], total=13
+                warp_offsets[w] = total;
+                total += warp_num_candidates[w];
+            }
+            
+            // check capacity for overflow case
+            // if we reach capacity just clamp to capacity
+            int capacityRemaining = MAX_CIRCLES_PER_BLOCK - num_candidates;
+            if (capacityRemaining < 0) capacityRemaining = 0;
+            if (total > capacityRemaining) {
+                candidates_to_write = capacityRemaining;
+                overflow = true;
+            } else {
+                candidates_to_write = total;
+            }
+
+            candidate_offset = num_candidates;
+            num_candidates += candidates_to_write;
         }
         __syncthreads();
 
-        // last thread updates total count added in this block
-        if (linearThreadIndex == SCAN_BLOCK_DIM - 1) {
-            int new_num_candidates = num_candidates + write_loc_offset + is_in_box;
-            // check if we've exceeded capacity, in which case set overflow
-            if (new_num_candidates > MAX_CIRCLES_PER_BLOCK) overflow = true;
-            num_candidates = min(new_num_candidates, MAX_CIRCLES_PER_BLOCK);
+        // --- write candidates for warp to smem ---
+        // write our warp's indices based on 1) starting offset for our warp, 2) how many circles to write (potentially clamped)
+        int warp_offset = warp_offsets[warp_id];
+        int warp_to_write_cnt = candidates_to_write - warp_offset;
+        if (warp_to_write_cnt > 0) {
+            if (is_in_box && lane_offset < warp_to_write_cnt) {  // mask off any lanes that go over
+                candidate_circles[candidate_offset + warp_offset + lane_offset] = circleIndex;
+            }
         }
         __syncthreads();
 

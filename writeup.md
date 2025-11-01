@@ -1,8 +1,10 @@
-# Part 1: SAXPY
+# Assignment 3 Writeup
 
-## Question 1
+**SUNET IDS**: `rishic3`, `madani49`
 
-**What performance do you observe compared to the sequential CPU-based implementation of SAXPY (recall your results from saxpy on Program 5 from Assignment 1)?**
+## Part 1: SAXPY
+
+**Results:**
 
 ```text
 ---------------------------------------------------------
@@ -21,15 +23,18 @@ Effective BW by CUDA saxpy: 207.892 ms          [5.376 GB/s]
 Kernel time by CUDA saxpy: 4.863 ms
 ```
 
-## Question 2
+### Question 1
 
-**Compare and explain the difference between the results provided by two sets of timers (timing only the kernel execution vs. timing the entire process of moving data to the GPU and back in addition to the kernel execution). Are the bandwidth values observed roughly consistent with the reported bandwidths available to the different components of the machine? (You should use the web to track down the memory bandwidth of an NVIDIA T4 GPU. Hint: https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-t4/t4-tensor-core-datasheet-951643.pdf. The expected bandwidth of memory bus of AWS is 5.3 GB/s, which does not match that of a 16-lane PCIe 3.0. Several factors prevent peak bandwidth, including CPU motherboard chipset performance and whether or not the host CPU memory used as the source of the transfer is “pinned” — the latter allows the GPU to directly access memory without going through virtual memory address translation. If you are interested, you can find more info here: https://kth.instructure.com/courses/12406/pages/optimizing-host-device-data-communication-i-pinned-host-memory)**
+In CPU sequential SAXPY we observed roughly 10ms performance when parallelizing over ISPC on CPU cores. Here with far more cores we achieve only ~2x speedup in our best run. This can be attributed to the fact that firstly — as we observed in assignment 1 — our program is memory bound, and additionally the working set is likely not large enough to hide the memory transfer latency between host CPU and device GPU memory. All of these factors work against our speedup, despite the massive amount of parallel compute available.
 
-# Part 2: Exclusive Scan and Find Repeats
+### Question 2
 
-### Initial implementation:
+No, the BW does not match the theoretical maximums on the datasheet for either 300GB/s DRAM or 32GB/s PCIE links. This is explained by the fact that memory transfer time for this program is dominated by the memory copies to and from the Host CPU, which means that in reality, we are predictably limited by the lower throughput AWS memory bus (rated 5.3GB/s). This aligns with the effective BW numbers we observe above.
 
-Scan tests
+## Part 2: Exclusive Scan and Find Repeats
+
+We made two implementations, shown in `exclusive_scan()` with and without the `do_better` flag. The initial implementation (using kernels `scan_upsweep` and `scan_downsweep`) follows the README directions, with an upsweep and downsweep kernel, which are iteratively invoked with decreasing/increasing granularity respectively. Using this implementation, we see the following numbers:
+
 ```text
 -------------------------
 Scan Score Table:
@@ -46,7 +51,6 @@ Scan Score Table:
 -------------------------------------------------------------------------
 ```
 
-Find repeats tests
 ```text
 -------------------------
 Find_repeats Score Table:
@@ -63,9 +67,10 @@ Find_repeats Score Table:
 -------------------------------------------------------------------------
 ```
 
-### Do better enabled:
+We felt we could do better by avoiding the many (2logN) kernel launches and repeated reads/writes to global memory by combining the sweeps into a single kernel, and performing the scan in shared memory. This implementation was actually what we felt to be more intuitive from the start of this problem. 
 
-Scan tests
+The improved implementation (using kernels `excl_scan_block`, `excl_scan`, and `uniform_add`) uses a recursive approach to perform the scan in shared memory (the upsweep/downsweep loops are brought into the kernel), collect the sums into an intermediate array, and then recursively scan the block-level sums. This continues until the working set is small enough to fit in a single block, at which point we run a final block-level kernel. The scanned sums can be added back uniformly to the block's elements using a simple kernel. We observed the following improvements (which are notable—up to ~2.5x improvement over the initial implementation—at large scales):
+
 ```text
 -------------------------
 Scan Score Table:
@@ -82,7 +87,6 @@ Scan Score Table:
 -------------------------------------------------------------------------
 ```
 
-Find repeats tests
 ```text
 -------------------------
 Find_repeats Score Table:
@@ -99,7 +103,7 @@ Find_repeats Score Table:
 -------------------------------------------------------------------------
 ```
 
-# Part 3: Circle Render
+## Part 3: Circle Render
 
 <b>We would like you to hand in a clear, high-level description of how your implementation works as well as a brief description of how you arrived at this solution. Specifically address approaches you tried along the way, and how you went about determining how to optimize your code (For example, what measurements did you perform to guide your optimization efforts?).
 
@@ -112,17 +116,17 @@ Aspects of your work that you should mention in the write-up include:
 5. What, if any, steps did you take to reduce communication requirements (e.g., synchronization or main memory bandwidth requirements)?
 6. Briefly describe how you arrived at your final solution. What other approaches did you try along the way. What was wrong with them?</b>
 
-So our two core initial issues are atomicity and ordering. Currently, each thread in the `kernelRenderCircles` kernel is assigned a circle, and they all run concurrently. Thus there is no atomicity guarantee when reading and writing to potentially overlapping pixels, nor is there an ordering guarantee when processing circles.
+Our two core initial issues are atomicity and ordering. In the starter code, each thread in the `kernelRenderCircles` kernel is assigned a circle, and they all run concurrently, handling potentially overlapping pixels. Thus there is no atomicity guarantee when two threads are reading and writing to the same pixels, nor is there an ordering guarantee when processing circles.
 
-My immediate thinking is that logically, we should group circles that overlap together, and separate groups that do not overlap. Within each group, the circles should be ordered by input order and processed sequentially. Visually, this would look a bit like a histogram where buckets are ordered by input order.
+Our first thought was that logically, we should group circles that overlap together, and separate groups that do not overlap. Within each group, the circles should be ordered by input order and processed sequentially. Visually, we imagined something like a histogram where buckets are ordered by input order.
 
-The next question was how to parallelize this. The naive first thing I thought of was assigning each group of circles to a logical thread, and then each thread processes its group of circles sequentially. But this doesn't really map well to CUDA hardware, and if we did this literally we wouldn't be leveraging the second dimension of parallelism (parallelism across pixels). Compute-wise the pixel grid is ideal for a 1:1 thread-to-pixel mapping.
+The next question was how to parallelize this. The naive first thing we thought of was assigning each group of circles to a logical thread, and then each thread processes its group of circles sequentially. But this doesn't really map well to CUDA hardware, and if we did this literally we wouldn't be leveraging the second dimension of parallelism mentioned in the README: parallelism across pixels. Compute-wise, it makes sense for pixels to be mapped 1:1 to threads, as this simplifies how the image is split up.
 
-## first approach
+### First Approach
 
-So my initial approach was to have each thread process a single pixel, and have all threads walk through **all circles** and apply any relevant updates to that pixel. This is obviously not efficient from a work perspective (checking every circle against every pixel) or a coherence perspective, and I'm noting the hint about using `circleBoxTest.cu_inl`. But in the spirit of doing the easiest thing first, this leads us to a very simple kernel work assignment, and solves the atomicity issue (which obviates the ordering issue as well).
+This led us to our first approach, which was to have each thread process a single pixel, and have all threads walk through **all circles** and apply any relevant updates to that pixel. This is obviously not efficient from a work perspective (checking every circle against every pixel) or a coherence perspective, and we noted the hint about using `circleBoxTest.cu_inl`. But in the spirit of doing the easiest thing first, this lead us to a very simple static work assignment across pixels, and it solved the atomicity issue (and in doing so, it obviated the ordering issue as well, since each thread walks through circles in order). No synchronization was required, since pixels are handled entirely independently.
 
-My initial implementation:
+Our pseudo-code:
 ```text
 for each pixel (parallelized across threads)
     get my (x,y) coordinates
@@ -133,7 +137,7 @@ for each pixel (parallelized across threads)
     write my final accumulated color to global memory
 ```
 
-With the following kernel:
+And the kernel:
 ```cpp
 template<SceneName scene>
 __global__ void kernelRenderCircles() {
@@ -203,7 +207,8 @@ __global__ void kernelRenderCircles() {
 }
 ```
 
-The first pass resolved the correctness issues, which was a good sign for the first pass. But the performance was poor, as expected given the obvious inefficencies we decided to accept for the initial approach.
+We observed the following results on the AWS T4G machine. We were happy to see the correctness issues resolved, but as we expected, the performance was poor given the inefficencies we decided to accept for the initial approach.
+
 ```text
 --------------------------------------------------------------------------
 | Scene Name      | Ref Time (T_ref) | Your Time (T)   | Score           |
@@ -221,15 +226,15 @@ The first pass resolved the correctness issues, which was a good sign for the fi
 --------------------------------------------------------------------------
 ```
 
-## second approach
+### Second Approach
 
-The next step is fairly clear; we want to avoid the inefficient pixels x circles comparisons. The provided `circleBoxTest.cu_inl` is an implication that we can do some pre-filtering to try to restrict the groups that any given pixel (thread) needs to look at when checking whether that circle contributes. 
+Given the helpful hints in the README, our next step was fairly clear: we wanted to avoid the inefficient `pixels x circles` comparisons, and we wanted parallelism across circles. Some threads are checking circles that are nowhere near their pixel, so we could be smarter about which circles to check. The provided `circleBoxTest.cu_inl` is an implication that we can do some pre-filtering to try to restrict the groups that any given thread needs to look at when checking whether that circle contributes to their pixel.
 
-At the moment, the filtering is done at a 'per-pixel granularity', so to speak. What we could do instead is increase the granularity to each block. Each block can do an initial filtration — e.g., the block cooperatively filters the list into just the overlapping circles for the given block — and then proceeds into the same thread-per-pixel kernel, but now each pixels has a much smaller sub-list in its consideration set.
+Our high-level thought was that, since we have a nice static assignment of thread blocks to pixel blocks, each block can do an initial filtration — e.g., the block cooperatively filters the list into just the overlapping circles for the given block — and then proceeds into the same thread-per-pixel kernel, but now each pixel has a (hopefully much smaller) sub-list in its consideration set when doing the shading.
 
-My idea here is to compute the bounding box of the block, and in the prefiltering stage, each thread will handle a subset of the circles and check the overlap with the block. Any overlapping circles will be added to a candidate list in shared memory. As a result, we only need to iterate over the (hopefully much smaller) candidate list in the shading loop.
+For cooperation, each thread would handle a subset of the circles and check the overlap with the block. Any overlapping circles would be added to a candidate list in shared memory. 
 
-Below, I am anticipating that the candidate circles could exceed the shared memory size in rare cases. As a naive fallback, I've added an overflow flag that will fallback to the slower loop that iterates over all circles.
+While implementing this, we realized that the number of candidate circles could exceed shared memory size. As a simple fallback, we added an overflow flag that would force the kernel to fall back to our slower first approach that iterates over all circles.
 
 ```cpp
 template<SceneName scene>
@@ -338,7 +343,7 @@ __global__ void kernelRenderCircles() {
 }
 ```
 
-After testing my implementation:
+After testing our implementation:
 
 ```
 --------------------------------------------------------------------------
@@ -356,9 +361,9 @@ After testing my implementation:
 |                                    | Total score:    | 18/72           |
 --------------------------------------------------------------------------
 ```
-...one of the correctness criteria was broken. Notably each thread is atomically updating an index to track the number of candidates, but this doesn't preserve the *ordering* of the candidates, now that we're processing circles in parallel.
+...we realized we broke our correctness criteria. Each thread was atomically updating an index to track the number of candidates, but this was not preserving the *ordering* of the candidates as they are appended to the list, now that we're processing circles in parallel.
 
-A new challenge is to leverage the parallelism across circles while preserving the ordering. Using a hint from the README about exclusive scan (and on EdStem - thanks Weixin!), 
+A new challenge was to get the candidate circles back in sorted order. Using a hint from the README (and on EdStem - thanks Weixin!), we realized we could do this using exclusive scan, similar to part 2 of the assignment, as shown below:
 
 ```cpp
 template<SceneName scene>
@@ -450,7 +455,7 @@ __global__ void kernelRenderCircles() {
     const float kCircleMaxAlpha = .5f;
     const float falloffScale = 4.f;
 
-    // if overflow, we'll check all circles as a fallback (bad - please don't happen)
+    // if overflow, we'll check all circles as a fallback
     int candidates_to_check = overflow ? numCircles : num_candidates;
 
     // iterate over candidate circles sequentially
@@ -498,7 +503,7 @@ __global__ void kernelRenderCircles() {
 }
 ```
 
-yay, it works:
+With this, we were able to restore correctness and meet the performance requirements. Hooray!
 ```text
 --------------------------------------------------------------------------
 | Scene Name      | Ref Time (T_ref) | Your Time (T)   | Score           |
@@ -516,22 +521,17 @@ yay, it works:
 --------------------------------------------------------------------------
 ```
 
-Profiling with 
+### Optimizations
+
+To look for optimization opportunities within the kernel, we profiled rand1M with NCU, using this command:
+
 ```shell
 $ sudo /usr/local/cuda-12.8/bin/ncu --set full ./render -c rand1M -s 1024
+```
 
-...
+What stuck out to us was the following:
 
-    Section: Warp State Statistics
-    ---------------------------------------- ----------- ------------
-    Metric Name                              Metric Unit Metric Value
-    ---------------------------------------- ----------- ------------
-    Warp Cycles Per Issued Instruction             cycle        22.58
-    Warp Cycles Per Executed Instruction           cycle        22.60
-    Avg. Active Threads Per Warp                                29.81
-    Avg. Not Predicated Off Threads Per Warp                    28.44
-    ---------------------------------------- ----------- ------------
-
+```text
     OPT   Est. Speedup: 35.04%                                                                                          
           On average, each warp of this workload spends 10.9 cycles being stalled waiting for sibling warps at a CTA    
           barrier. A high number of warps waiting at a barrier is commonly caused by diverging code paths before a      
@@ -541,24 +541,43 @@ $ sudo /usr/local/cuda-12.8/bin/ncu --set full ./render -c rand1M -s 1024
           affecting occupancy, unless shared memory becomes a new occupancy limiter. Also, try to identify which        
           barrier instruction causes the most stalls, and optimize the code executed before that synchronization point  
           first. This stall type represents about 48.2% of the total average of 22.6 cycles between issuing two         
-          instructions.  
-...
+          instructions.     
 ```
+Our immediate next thought was about how to eliminate the number of `__syncthreads()` invocations, of which there are many. The syncs are ultimately required due to sharedMemExclusiveScan— for each block, we need an initial sync after checking circle overlap and writing that to shared memory, another sync after running the scan, a third after writing to candidates, and a fourth after updating the total count, not to mention the 3 internal barriers within the scan itself. Per the profiler, we were wasting 10.9 cycles per warp on average waiting for sibling warps to arrive at barriers.
 
+Our goal was to keep the thread-per-pixel, collaboratively pre-filter circles within a block design. Given With insight from a very helpful blog (https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/), we were looking to 
 
-2-kernel approach:
+Our immediate next thought was about how to eliminate the number of `__syncthreads()` invocations, of which there are many. The syncs are ultimately required due to sharedMemExclusiveScan— for each block, we need an initial sync after checking circle overlap and writing that to shared memory, another sync after running the scan, a third after writing to candidates, and a fourth after updating the total count, not to mention the internal barriers within the scan itself. Per the profiler, we were wasting 10.9 cycles per warp on average waiting for sibling warps to arrive at barriers.
+
+Our goal was to keep the thread-per-pixel, collaboratively pre-filter circles within a block design. We were really keen to try to do some warp-level primitives since we recognized that warps can basically share information for free without explicit synchronization, since they execute in lockstep via SIMT anyway. With insight from this very nice NVIDIA blog (https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/) it was possible to remove the block-wise prefix sum entirely.
+
+Our idea was as follows:
+- the block still cooperatively checks `is_in_box`, with each thread handing a chunk
+- each warp will collect the `is_in_box` results with no synchronization using warp primitives (ballot and popc)
+    - as part of this, the warp computes its *write offset within the warp, aka, the lane offset*
+- we run a really small exclusive scan over just the warp counts for the entire block (256/32 = 8 elements) to compute where each warp should write - combining this with lane offset, we now have the *write offset within the block*
+
+So we basically decompose the initial exclusive scan into two levels - warp and then block - with far fewer syncs (now only 3 vs. 7 previously) since we are sharing information within the warp for free in the first stage, and with a much smaller prefix sum since the data is already aggregated per warp.
+
+In our final optimized version, here is what we observed on the AWS T4G:
 ```text
+------------
+Score table:
+------------
 --------------------------------------------------------------------------
 | Scene Name      | Ref Time (T_ref) | Your Time (T)   | Score           |
 --------------------------------------------------------------------------
-| rgb             | 0.2498           | 0.3171          | 8               |
-| rand10k         | 3.0559           | 3.1473          | 9               |
-| rand100k        | 29.6081          | 30.4529         | 9               |
-| pattern         | 0.3919           | 0.5112          | 8               |
-| snowsingle      | 19.5758          | 19.8229         | 9               |
-| biglittle       | 15.1747          | 16.117          | 9               |
-| rand1M          | 228.0776         | 218.5261        | 9               |
-| micro2M         | 440.0755         | 420.3085        | 9               |
+| rgb             | 0.2649           | 0.2624          | 9               |
+| rand10k         | 3.0795           | 1.6906          | 9               |
+| rand100k        | 29.5175          | 15.4693         | 9               |
+| pattern         | 0.4083           | 0.2749          | 9               |
+| snowsingle      | 19.5749          | 7.3637          | 9               |
+| biglittle       | 15.2305          | 13.0302         | 9               |
+| rand1M          | 230.3938         | 105.8901        | 9               |
+| micro2M         | 441.3776         | 198.4038        | 9               |
 --------------------------------------------------------------------------
-|                                    | Total score:    | 70/72           |
+|                                    | Total score:    | 72/72           |
+--------------------------------------------------------------------------
 ```
+
+While some smaller tests (like rgb, biglittle) noticed marginal improvement, the tests with many circles (rand1M and micro2M) noticed the biggest speedup. This makes sense given that every iteration per circle now had less than half the block-wide synchronizations than before.
