@@ -561,9 +561,6 @@ So we basically decompose the initial exclusive scan into two levels - warp and 
 
 In our final optimized version, here is what we observed on the AWS T4G:
 ```text
-------------
-Score table:
-------------
 --------------------------------------------------------------------------
 | Scene Name      | Ref Time (T_ref) | Your Time (T)   | Score           |
 --------------------------------------------------------------------------
